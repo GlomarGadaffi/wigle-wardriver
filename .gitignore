@@ -2,3 +2,11 @@
 *.bin
 .vscode
 build/
+
+# local docs — read the code
+docs/
+notes/
+*.txt
+LINEAGE.md
+*.old
+*.bak
