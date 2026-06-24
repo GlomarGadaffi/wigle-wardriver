@@ -1,4 +1,4 @@
-# ashburn-drifter
+# wigle-wardriver
 
 portable ESP32-based WiFi and Bluetooth scanner for Wigle.net. scans all 802.11 and BLE beacons in range, uploads geolocation results to Wigle (with user auth), and logs local cache for offline use.
 
