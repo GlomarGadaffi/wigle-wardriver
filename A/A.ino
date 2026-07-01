@@ -21,6 +21,15 @@ const String VERSION = "1.3.0b2";
 #include "esp_log.h"
 static const char* LOG_TAG_GENERIC = "wdGeneric";
 
+//Parallel MQTT publish to an orbic-fusion broker, alongside (not instead of)
+//the WiGLE CSV/upload path above. Uses the same connected-WiFi window that
+//wigle_upload_all() already runs in (below) -- the scan radio itself stays
+//disconnected during primary_scan_loop, see setup_wifi(), so this is
+//necessarily batched on each connect rather than truly per-scan live.
+#include <PubSubClient.h>
+WiFiClient mqtt_wifi_client;
+PubSubClient mqtt_client(mqtt_wifi_client);
+
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -1264,6 +1273,120 @@ void wigle_upload_all(){
   }
 }
 
+boolean mqtt_connect(){
+  //Connect to the orbic-fusion broker if one is configured. Empty broker
+  //string means the feature is off, matching this file's own convention for
+  //optional features (fb_ssid/fb_psk above use the same empty-string-means-
+  //disabled pattern).
+  String mqtt_broker = get_config_string("mqtt_broker", "");
+  if (mqtt_broker == ""){
+    return false;
+  }
+  if (mqtt_client.connected()){
+    return true;
+  }
+  int mqtt_port = get_config_int("mqtt_port", 1883);
+  mqtt_client.setServer(mqtt_broker.c_str(), mqtt_port);
+  //Default PubSubClient buffer (256B) can be too small once a long SSID/
+  //auth-mode string lands in the JSON payload; 512 gives real headroom.
+  mqtt_client.setBufferSize(512);
+  String client_id = "wigle-wardriver-" + String(chip_id);
+  ESP_LOGD(LOG_TAG_GENERIC, "Connecting to MQTT broker %s:%i", mqtt_broker.c_str(), mqtt_port);
+  return mqtt_client.connect(client_id.c_str());
+}
+
+void mqtt_publish_all(){
+  //Mirrors wigle_upload_all()'s file-iteration shape, but tracks its own
+  //"already published" watermark (mqtt_mf) separately from WiGLE's (wigle_mf)
+  //-- the two sinks are independent, one shouldn't gate the other.
+  if (!mqtt_connect()){
+    ESP_LOGV(LOG_TAG_GENERIC, "MQTT not configured or connect failed, skipping publish");
+    return;
+  }
+  long min_fileid = preferences.getLong("mqtt_mf",0);
+  if (min_fileid == 0){
+    preferences.putLong("mqtt_mf",bootcount);
+    return;
+  }
+  String topic = "wigle-wardriver/" + String(chip_id) + "/scan";
+  File dir = SD.open("/");
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) {
+      break;
+    }
+    if (entry.isDirectory()){
+      continue;
+    }
+    String filename = entry.name();
+    if (filename.charAt(0) != '/'){
+      filename = "/" + filename;
+    }
+    if (!filename.endsWith(".csv")){
+      continue;
+    }
+    int first_pos = filename.indexOf("wd3-")+4;
+    int second_pos = filename.indexOf(".", first_pos);
+    String filename_id = filename.substring(first_pos, second_pos);
+    unsigned int filename_id_int = (int) filename_id.toInt();
+    if (filename_id_int < min_fileid){
+      continue;
+    }
+
+    File reader = SD.open(filename, FILE_READ);
+    int line_num = 0;
+    while (reader.available()){
+      String line = reader.readStringUntil('\n');
+      line.trim();
+      line_num++;
+      if (line_num <= 2 || line == ""){
+        //Line 1 is the WigleWifi-1.4 app banner, line 2 is the column header.
+        continue;
+      }
+      //MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type
+      int idx[10];
+      int pos = -1;
+      boolean ok = true;
+      for (int f = 0; f < 10; f++){
+        pos = line.indexOf(',', pos+1);
+        if (pos < 0){ ok = false; break; }
+        idx[f] = pos;
+      }
+      if (!ok) continue;
+      String mac        = line.substring(0, idx[0]);
+      String ssid       = line.substring(idx[0]+1, idx[1]);
+      String auth        = line.substring(idx[1]+1, idx[2]);
+      String first_seen = line.substring(idx[2]+1, idx[3]);
+      String channel     = line.substring(idx[3]+1, idx[4]);
+      String rssi        = line.substring(idx[4]+1, idx[5]);
+      String lat         = line.substring(idx[5]+1, idx[6]);
+      String lon         = line.substring(idx[6]+1, idx[7]);
+      String alt         = line.substring(idx[7]+1, idx[8]);
+      String acc         = line.substring(idx[8]+1, idx[9]);
+      String type        = line.substring(idx[9]+1);
+      ssid.replace("\"","\\\"");
+
+      String json = "{\"t\":\"scan\",\"mac\":\"" + mac + "\",\"ssid\":\"" + ssid +
+        "\",\"auth\":\"" + auth + "\",\"first_seen\":\"" + first_seen +
+        "\",\"channel\":" + channel + ",\"rssi\":" + rssi +
+        ",\"lat\":" + lat + ",\"lon\":" + lon + ",\"alt\":" + alt +
+        ",\"acc\":" + acc + ",\"type\":\"" + type + "\"}";
+
+      if (!mqtt_client.connected()){
+        //Broker link dropped mid-file -- stop for this round, min_fileid
+        //stays where it was so this file is retried next connected window.
+        reader.close();
+        dir.close();
+        return;
+      }
+      mqtt_client.publish(topic.c_str(), json.c_str());
+      mqtt_client.loop();
+    }
+    reader.close();
+    preferences.putLong("mqtt_mf", filename_id_int);
+  }
+}
+
 void boot_config(){
   //Load configuration variables and perform first time setup if required.
   ESP_LOGV(LOG_TAG_GENERIC, "running boot_config()");
@@ -1640,6 +1763,7 @@ void boot_config(){
         } else {
           ESP_LOGV(LOG_TAG_GENERIC, "Not performing WiGLE autoupload - it is disabled");
         }
+        mqtt_publish_all();
 
         update_available = check_for_updates(is_stable, false);
       }
